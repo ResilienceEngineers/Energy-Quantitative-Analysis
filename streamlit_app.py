@@ -5,9 +5,40 @@ import plotly.graph_objects as go
 from datetime import datetime, timedelta
 
 # --- PAGE CONFIG ---
-st.set_page_config(page_title="EU Gas Risk Calculator", layout="wide")
+st.set_page_config(
+    page_title="EU Gas Risk Calculator",
+    page_icon="⚡",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-# --- 1. SIMULATION ENGINE (The PhD Logic) ---
+# --- SESSION STATE MANAGEMENT (For Reset Button) ---
+def reset_defaults():
+    st.session_state.w_weather_preset = '1. Baseline (Normal)'
+    st.session_state.w_forced = 0
+    st.session_state.w_uplift = 0.15
+    st.session_state.w_obs = 1
+    
+    st.session_state.chk_russia = False
+    st.session_state.chk_lng = False
+    st.session_state.chk_infra = False
+    st.session_state.chk_custom = False
+    st.session_state.w_custom_val = 0.5
+    
+    st.session_state.w_mit_on = True
+    st.session_state.w_mit_trig = 0.40
+    st.session_state.w_mit_resp = 0.15
+    
+    st.session_state.w_start = 575.5
+    st.session_state.w_weeks = 12
+    st.session_state.w_base_d = 85.0
+    st.session_state.w_base_s = 70.0
+
+# Initialize Session State if not present
+if 'w_weather_preset' not in st.session_state:
+    reset_defaults()
+
+# --- 1. SIMULATION ENGINE ---
 class MasterEngine:
     def __init__(self):
         self.CAPACITY = 1143.0  # TWh
@@ -54,7 +85,7 @@ class MasterEngine:
             log_mu = np.log(demand_t) - 0.5 * log_sigma**2
             demand_draw = np.random.lognormal(log_mu, log_sigma)
             
-            # Mitigation
+            # Mitigation (Applied to Both if triggered)
             d_b, d_s = demand_draw, demand_draw
             if inputs['mit_on']:
                 mask_b = s_base[:, t] < (self.CAPACITY * inputs['mit_trigger'])
@@ -80,40 +111,78 @@ class MasterEngine:
         mask_05 = storage[:, t+1] < (self.CAPACITY * 0.05)
         f05[mask_05 & np.isnan(f05)] = t + 1
 
-# --- 2. SIDEBAR CONTROLS ---
-st.sidebar.header("🎛️ Control Center")
+# --- 2. SIDEBAR CONTROL CENTER ---
+st.sidebar.title("🎛️ Control Center")
 
+if st.sidebar.button("↺ Reset All Defaults", on_click=reset_defaults):
+    st.experimental_rerun()
+
+# --- BOX 1: WEATHER ---
 with st.sidebar.expander("1. Weather Scenario", expanded=True):
-    weather_mode = st.selectbox("Preset:", ['1. Baseline (Normal)', '2. Cold Snap (2 Wks)', '3. Deep Freeze (Month)'])
+    weather_mode = st.selectbox(
+        "Preset:", 
+        ['1. Baseline (Normal)', '2. Cold Snap (2 Wks)', '3. Deep Freeze (Month)'],
+        key='w_weather_preset'
+    )
     
-    # Defaults based on preset
-    def_forced, def_uplift, def_obs = 0, 0.15, 1
-    if 'Cold Snap' in weather_mode: def_forced, def_uplift, def_obs = 2, 0.25, 3
-    if 'Deep Freeze' in weather_mode: def_forced, def_uplift, def_obs = 4, 0.40, 4
+    # Auto-update sliders based on preset (unless manually moved)
+    if 'Baseline' in weather_mode:
+        st.info("ℹ️ **Baseline:** Standard seasonality. No extreme cold events.")
+    elif 'Cold Snap' in weather_mode:
+        st.info("❄️ **Cold Snap:** 2 weeks of high pressure cold (+25% demand).")
+    elif 'Deep Freeze' in weather_mode:
+        st.warning("⚠️ **Deep Freeze:** 4 weeks of extreme cold (+40% demand).")
     
-    w_forced = st.slider("Forced Cold Weeks", 0, 10, def_forced)
-    w_uplift = st.slider("Demand Uplift", 0.0, 0.6, def_uplift, 0.05)
-    w_obs = st.slider("Observed Cold (Last 4w)", 0, 4, def_obs)
+    st.markdown("**Manual Variables:**")
+    w_forced = st.slider("Forced Cold Weeks", 0, 10, key='w_forced')
+    w_uplift = st.slider("Demand Uplift (+%)", 0.0, 0.6, step=0.05, key='w_uplift')
+    w_obs = st.slider("Observed Cold (Last 4w)", 0, 4, key='w_obs')
 
+# --- BOX 2: SHOCKS ---
 with st.sidebar.expander("2. Supply Shocks", expanded=True):
-    chk_russia = st.checkbox("Russian Stop (-0.5 TWh/d)")
-    chk_lng = st.checkbox("LNG Crisis (-0.8 TWh/d)")
-    chk_infra = st.checkbox("Infra Fail (-1.2 TWh/d)")
-    chk_custom = st.checkbox("Custom Shock")
-    w_custom_val = st.slider("Custom Loss (TWh/d)", 0.1, 3.0, 0.5, disabled=not chk_custom)
+    st.markdown("Select active disruptions:")
+    chk_russia = st.checkbox("Russian Stop (-0.5 TWh/d)", key='chk_russia')
+    chk_lng = st.checkbox("LNG Crisis (-0.8 TWh/d)", key='chk_lng')
+    chk_infra = st.checkbox("Infra Fail (-1.2 TWh/d)", key='chk_infra')
+    chk_custom = st.checkbox("Custom Shock", key='chk_custom')
+    w_custom_val = st.slider("Custom Loss (TWh/d)", 0.1, 3.0, step=0.1, disabled=not chk_custom, key='w_custom_val')
 
-with st.sidebar.expander("3. Settings"):
-    w_mit_on = st.checkbox("Enable Market Elasticity", value=True)
-    w_start = st.number_input("Start Storage (TWh)", value=575.5)
-    w_weeks = st.slider("Horizon (Weeks)", 4, 20, 12)
-    w_base_d = st.number_input("Base Demand (TWh)", value=85.0)
-    w_base_s = st.number_input("Base Supply (TWh)", value=70.0)
+# --- BOX 3: MITIGATION (NEW!) ---
+with st.sidebar.expander("3. Mitigation & Elasticity", expanded=True):
+    st.markdown("Define how the market reacts to high prices.")
+    w_mit_on = st.checkbox("Enable Demand Response", key='w_mit_on')
+    
+    if w_mit_on:
+        st.success("✅ **Active:** Industry will cut demand if storage drops.")
+        w_mit_trig = st.slider(
+            "Price Trigger (Storage %)", 
+            0.1, 0.6, step=0.05, 
+            key='w_mit_trig',
+            help="If storage falls below this level, prices spike and mitigation starts."
+        )
+        w_mit_resp = st.slider(
+            "Demand Reduction (%)", 
+            0.05, 0.30, step=0.05, 
+            key='w_mit_resp',
+            help="Percentage of demand destroyed by high prices (Industry shutdown)."
+        )
+    else:
+        st.error("❌ **Inactive:** Demand remains inelastic regardless of shortages.")
+        w_mit_trig = 0.40
+        w_mit_resp = 0.0
+
+# --- BOX 4: SETTINGS ---
+with st.sidebar.expander("4. Simulation Settings", expanded=False):
+    w_start = st.number_input("Start Storage (TWh)", key='w_start')
+    w_weeks = st.slider("Horizon (Weeks)", 4, 20, key='w_weeks')
+    w_base_d = st.number_input("Base Demand (TWh)", key='w_base_d')
+    w_base_s = st.number_input("Base Supply (TWh)", key='w_base_s')
 
 # --- 3. MAIN DASHBOARD ---
 st.title("🇪🇺 EU Gas Risk Analyzer")
-st.markdown("### Executive Dashboard")
+st.markdown("### Executive Risk Dashboard")
 
-if st.button("🔄 Run Simulation", type="primary"):
+if st.button("🔄 Update Analysis", type="primary", use_container_width=True):
     
     # Inputs
     tot_shock = 0.0
@@ -126,7 +195,7 @@ if st.button("🔄 Run Simulation", type="primary"):
         'weeks': w_weeks, 'start_storage': w_start,
         'base_demand': w_base_d, 'base_supply': w_base_s,
         'forced_cold': w_forced, 'uplift': w_uplift, 'obs_cold': w_obs,
-        'mit_on': w_mit_on, 'mit_trigger': 0.40, 'mit_response': 0.15
+        'mit_on': w_mit_on, 'mit_trigger': w_mit_trig, 'mit_response': w_mit_resp
     }
     
     # Engine
@@ -167,7 +236,7 @@ if st.button("🔄 Run Simulation", type="primary"):
         fig_fan.add_trace(go.Scatter(x=x_ax, y=p50_s, mode='lines', name='Shock Scenario', line=dict(color='firebrick', width=3, dash='dot')))
         fig_fan.add_hline(y=1143*0.30, line_dash="dash", line_color="orange", annotation_text="30% Rationing")
         fig_fan.add_hline(y=1143*0.05, line_color="red", annotation_text="5% Blackout")
-        fig_fan.update_layout(title='Storage Trajectory Gap', height=400, template='plotly_white')
+        fig_fan.update_layout(title='Storage Trajectory Gap', height=400, template='plotly_white', hovermode="x unified")
         st.plotly_chart(fig_fan, use_container_width=True)
 
     with tab_chart2:
