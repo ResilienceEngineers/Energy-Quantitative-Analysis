@@ -12,33 +12,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# --- SESSION STATE MANAGEMENT ---
-def reset_defaults():
-    st.session_state.w_weather_preset = '1. Baseline (Normal)'
-    st.session_state.w_forced = 0
-    st.session_state.w_uplift = 0.15
-    st.session_state.w_obs = 1
-    
-    st.session_state.chk_russia = False
-    st.session_state.chk_lng = False
-    st.session_state.chk_infra = False
-    st.session_state.chk_custom = False
-    st.session_state.w_custom_val = 0.5
-    
-    st.session_state.w_mit_on = True
-    st.session_state.w_mit_trig = 0.40
-    st.session_state.w_mit_resp = 0.15
-    
-    st.session_state.w_start = 575.5
-    st.session_state.w_weeks = 12
-    st.session_state.w_base_d = 88.0 # Tuned for realism (Cold Jan)
-    st.session_state.w_base_s = 68.0 # Tuned for realism (Tight Supply)
-
-# Initialize Session State
-if 'w_weather_preset' not in st.session_state:
-    reset_defaults()
-
-# --- 1. SIMULATION ENGINE (PhD Level) ---
+# --- 1. SIMULATION ENGINE ---
 class MasterEngine:
     def __init__(self):
         self.CAPACITY = 1143.0  # TWh
@@ -62,20 +36,16 @@ class MasterEngine:
         p_cold_dist = np.random.beta(alpha, beta_val, n_sims)
         
         # Supply
-        # Calibrated: Net Draw ~20 TWh/week in Jan (88 Dem - 68 Sup)
-        # This aligns with historical ~3-4 TWh/day drawdowns in peak winter.
         base_supply_vec = np.random.normal(inputs['base_supply'], 2.5, (n_sims, weeks))
         stress_supply_vec = base_supply_vec.copy()
         if active_shocks_loss > 0:
             stress_supply_vec -= (active_shocks_loss * 7.0)
             
         for t in range(weeks):
-            # Seasonality (Spring Taper)
-            # Jan: 100% | Feb: 95% | Mar: 85% | Apr: 70%
+            # Seasonality
             seasonality = 1.0
-            if t > 5: seasonality = 0.95
-            if t > 9: seasonality = 0.85
-            if t > 13: seasonality = 0.70
+            if t > 5: seasonality = 0.90
+            if t > 9: seasonality = 0.80
             
             # Weather
             is_cold = np.random.rand(n_sims) < p_cold_dist
@@ -84,9 +54,7 @@ class MasterEngine:
             # Demand
             base_d = inputs['base_demand'] * seasonality
             demand_t = base_d * (1 + (is_cold * inputs['uplift']))
-            
-            # Volatility (Increased to 12% to capture fat tails/extreme events)
-            sigma = 0.12 
+            sigma = 0.08
             log_sigma = np.sqrt(np.log(1 + (sigma/demand_t)**2))
             log_mu = np.log(demand_t) - 0.5 * log_sigma**2
             demand_draw = np.random.lognormal(log_mu, log_sigma)
@@ -108,9 +76,7 @@ class MasterEngine:
 
     def _step(self, storage, t, supply, demand, f30, f05):
         net = supply - demand
-        # Pressure Constraint: Below 15%, max withdrawal drops linearly
         low_p = storage[:, t] < (self.CAPACITY * 0.15)
-        # Cap withdrawal (e.g. max 65 TWh/week physical limit)
         net[low_p] = np.maximum(net[low_p], -65.0) 
         storage[:, t+1] = np.clip(storage[:, t] + net, 0, self.CAPACITY)
         
@@ -119,31 +85,73 @@ class MasterEngine:
         mask_05 = storage[:, t+1] < (self.CAPACITY * 0.05)
         f05[mask_05 & np.isnan(f05)] = t + 1
 
-# --- 2. SIDEBAR CONTROLS ---
+# --- 2. LOGIC FOR PRESET UPDATES ---
+def update_weather_settings():
+    """Callback to snap sliders to the selected preset."""
+    mode = st.session_state.weather_preset
+    if 'Baseline' in mode:
+        st.session_state.w_forced = 0
+        st.session_state.w_uplift = 0.15
+        st.session_state.w_obs = 1
+    elif 'Cold Snap' in mode:
+        st.session_state.w_forced = 2
+        st.session_state.w_uplift = 0.25
+        st.session_state.w_obs = 3
+    elif 'Deep Freeze' in mode:
+        st.session_state.w_forced = 4
+        st.session_state.w_uplift = 0.40
+        st.session_state.w_obs = 4
+
+def reset_all():
+    """Reset everything to factory defaults."""
+    st.session_state.weather_preset = '1. Baseline (Normal)'
+    update_weather_settings() # Apply baseline values
+    st.session_state.chk_russia = False
+    st.session_state.chk_lng = False
+    st.session_state.chk_infra = False
+    st.session_state.chk_custom = False
+    st.session_state.w_mit_on = True
+    st.session_state.w_start = 575.5
+
+# Initialize Session State Variables if they don't exist
+if 'w_forced' not in st.session_state:
+    st.session_state.w_forced = 0
+if 'w_uplift' not in st.session_state:
+    st.session_state.w_uplift = 0.15
+if 'w_obs' not in st.session_state:
+    st.session_state.w_obs = 1
+
+# --- 3. SIDEBAR CONTROL CENTER ---
 st.sidebar.title("🎛️ Control Center")
 
-if st.sidebar.button("↺ Reset Defaults"):
-    reset_defaults()
-    st.rerun() # UPDATED FIX
+if st.sidebar.button("↺ Reset All Defaults", on_click=reset_all):
+    pass # The callback handles the reset
 
 # --- BOX 1: WEATHER ---
 with st.sidebar.expander("1. Weather Scenario", expanded=True):
+    # The Selectbox now triggers the callback 'update_weather_settings'
     weather_mode = st.selectbox(
-        "Preset:", 
+        "Select Scenario:", 
         ['1. Baseline (Normal)', '2. Cold Snap (2 Wks)', '3. Deep Freeze (Month)'],
-        key='w_weather_preset'
+        key='weather_preset',
+        on_change=update_weather_settings
     )
     
+    # Contextual Help Text
     if 'Baseline' in weather_mode:
-        st.info("ℹ️ **Baseline:** Standard ENTSOG seasonality. Normal temps.")
+        st.info("ℹ️ **Baseline:** Standard seasonality. No extreme cold events.")
     elif 'Cold Snap' in weather_mode:
         st.info("❄️ **Cold Snap:** 2 weeks of high pressure cold (+25% demand).")
     elif 'Deep Freeze' in weather_mode:
         st.warning("⚠️ **Deep Freeze:** 'Beast from East'. 4 weeks of extreme cold (+40% demand).")
     
-    w_forced = st.slider("Forced Cold Weeks", 0, 10, key='w_forced')
-    w_uplift = st.slider("Demand Uplift (+%)", 0.0, 0.6, step=0.05, key='w_uplift')
-    w_obs = st.slider("Observed Cold (Last 4w)", 0, 4, key='w_obs')
+    st.markdown("---")
+    st.markdown("**Detailed Variables:**")
+    
+    # Sliders are bound to session_state keys
+    st.slider("Forced Cold Weeks", 0, 10, key='w_forced')
+    st.slider("Demand Uplift (+%)", 0.0, 0.6, step=0.05, key='w_uplift')
+    st.slider("Observed Cold (Last 4w)", 0, 4, key='w_obs')
 
 # --- BOX 2: SHOCKS ---
 with st.sidebar.expander("2. Supply Shocks", expanded=True):
@@ -156,29 +164,31 @@ with st.sidebar.expander("2. Supply Shocks", expanded=True):
 
 # --- BOX 3: MITIGATION ---
 with st.sidebar.expander("3. Mitigation & Elasticity", expanded=True):
-    st.markdown("Market reaction to high prices:")
-    w_mit_on = st.checkbox("Enable Demand Response", key='w_mit_on')
+    w_mit_on = st.checkbox("Enable Demand Response", value=True, key='w_mit_on')
     
     if w_mit_on:
-        w_mit_trig = st.slider("Price Trigger (Storage %)", 0.1, 0.6, step=0.05, key='w_mit_trig')
-        w_mit_resp = st.slider("Demand Cut (%)", 0.05, 0.30, step=0.05, key='w_mit_resp')
+        st.success("✅ **Active:** Industry cuts demand if prices spike.")
+        w_mit_trig = st.slider("Trigger (Storage %)", 0.1, 0.6, 0.40, 0.05, key='w_mit_trig')
+        w_mit_resp = st.slider("Demand Cut (%)", 0.05, 0.30, 0.15, 0.05, key='w_mit_resp')
     else:
-        w_mit_trig = 0.40; w_mit_resp = 0.0
+        st.error("❌ **Inactive:** Demand is inelastic.")
+        w_mit_trig = 0.40
+        w_mit_resp = 0.0
 
 # --- BOX 4: SETTINGS ---
-with st.sidebar.expander("4. Simulation Settings", expanded=False):
-    w_start = st.number_input("Start Storage (TWh)", key='w_start')
-    w_weeks = st.slider("Horizon (Weeks)", 4, 20, key='w_weeks')
-    w_base_d = st.number_input("Base Demand (TWh/wk)", key='w_base_d')
-    w_base_s = st.number_input("Base Supply (TWh/wk)", key='w_base_s')
+with st.sidebar.expander("4. Simulation Settings"):
+    w_start = st.number_input("Start Storage (TWh)", value=575.5, key='w_start')
+    w_weeks = st.slider("Horizon (Weeks)", 4, 20, 12, key='w_weeks')
+    w_base_d = st.number_input("Base Demand (TWh)", value=85.0, key='w_base_d')
+    w_base_s = st.number_input("Base Supply (TWh)", value=70.0, key='w_base_s')
 
-# --- 3. MAIN DASHBOARD ---
+# --- 4. MAIN DASHBOARD ---
 st.title("🇪🇺 EU Gas Risk Analyzer")
-st.markdown("### Quantitative Stress Test & Forecast")
+st.markdown("### Executive Risk Dashboard")
 
-if st.button("🔄 Run Simulation", type="primary", use_container_width=True):
+if st.button("🔄 Update Analysis", type="primary", use_container_width=True):
     
-    # Gather Inputs
+    # Inputs
     tot_shock = 0.0
     if chk_russia: tot_shock += 0.5
     if chk_lng: tot_shock += 0.8
@@ -188,18 +198,20 @@ if st.button("🔄 Run Simulation", type="primary", use_container_width=True):
     inputs = {
         'weeks': w_weeks, 'start_storage': w_start,
         'base_demand': w_base_d, 'base_supply': w_base_s,
-        'forced_cold': w_forced, 'uplift': w_uplift, 'obs_cold': w_obs,
+        'forced_cold': st.session_state.w_forced, 
+        'uplift': st.session_state.w_uplift, 
+        'obs_cold': st.session_state.w_obs,
         'mit_on': w_mit_on, 'mit_trigger': w_mit_trig, 'mit_response': w_mit_resp
     }
     
-    # Run Engine
+    # Engine
     eng = MasterEngine()
     p_b, p_s, f30_b, f30_s, f05_b, f05_s = eng.simulate(inputs, active_shocks_loss=tot_shock)
     
-    # Calculate Metrics
+    # Metrics
     r30_b = np.sum(~np.isnan(f30_b))/5000; r30_s = np.sum(~np.isnan(f30_s))/5000
     r05_b = np.sum(~np.isnan(f05_b))/5000; r05_s = np.sum(~np.isnan(f05_s))/5000
-    med_s = np.median(p_s[:,-1])
+    med_b = np.median(p_b[:,-1]); med_s = np.median(p_s[:,-1])
     
     # --- SCORECARD ---
     col1, col2, col3, col4 = st.columns(4)
@@ -212,13 +224,12 @@ if st.button("🔄 Run Simulation", type="primary", use_container_width=True):
     col1.metric("Grid Status", status, f"-{tot_shock:.1f} TWh/d Shock", delta_color=delta_color)
     col2.metric("Rationing Risk (<30%)", f"{r30_s:.1%}", f"vs {r30_b:.1%} Base", delta_color="inverse")
     col3.metric("Blackout Risk (<5%)", f"{r05_s:.1%}", f"vs {r05_b:.1%} Base", delta_color="inverse")
-    col4.metric("Median End Storage", f"{med_s:.0f} TWh", "Target: >340 TWh")
+    col4.metric("Median Storage", f"{med_s:.0f} TWh", f"Gap: -{med_b - med_s:.0f} TWh", delta_color="inverse")
 
-    # --- TABS FOR CHARTS ---
-    tab1, tab2 = st.tabs(["📉 Trajectory Comparison", "📅 Risk Timing Histogram"])
+    # --- CHARTS ---
+    tab_chart1, tab_chart2 = st.tabs(["📉 Trajectory Comparison", "📅 Risk Timing Histogram"])
     
-    with tab1:
-        # Fan Chart
+    with tab_chart1:
         x_ax = np.arange(inputs['weeks'] + 1)
         p50_b = np.median(p_b, axis=0); p50_s = np.median(p_s, axis=0)
         p10_s = np.percentile(p_s, 10, axis=0); p90_s = np.percentile(p_s, 90, axis=0)
@@ -228,40 +239,20 @@ if st.button("🔄 Run Simulation", type="primary", use_container_width=True):
         fig_fan.add_trace(go.Scatter(x=x_ax, y=p10_s, fill=None, mode='lines', line=dict(width=0), showlegend=False))
         fig_fan.add_trace(go.Scatter(x=x_ax, y=p90_s, fill='tonexty', fillcolor='rgba(255,0,0,0.1)', line=dict(width=0), name='Uncertainty (10-90%)'))
         fig_fan.add_trace(go.Scatter(x=x_ax, y=p50_s, mode='lines', name='Shock Scenario', line=dict(color='firebrick', width=3, dash='dot')))
-        
         fig_fan.add_hline(y=1143*0.30, line_dash="dash", line_color="orange", annotation_text="30% Rationing")
         fig_fan.add_hline(y=1143*0.05, line_color="red", annotation_text="5% Blackout")
-        
-        fig_fan.update_layout(title='Storage Trajectory Gap (Baseline vs. Shock)', height=400, template='plotly_white')
+        fig_fan.update_layout(title='Storage Trajectory Gap (Baseline vs. Shock)', height=400, template='plotly_white', hovermode="x unified")
         st.plotly_chart(fig_fan, use_container_width=True)
 
-    with tab2:
-        # Histogram of Most Likely Failure Dates
+    with tab_chart2:
         weeks_idx = np.arange(1, inputs['weeks'] + 1)
         counts = [np.sum(f30_s == w) for w in weeks_idx]
         probs = [c / 5000 for c in counts]
+        dates = [(datetime.now() + timedelta(weeks=int(i))).strftime('%b %d') for i in weeks_idx]
         
-        start_date = datetime.now()
-        dates = [(start_date + timedelta(weeks=int(i))).strftime('%b %d') for i in weeks_idx]
-        
-        # Highlight Peak
-        max_p = max(probs) if probs else 0
-        
-        fig_hist = go.Figure()
-        fig_hist.add_trace(go.Bar(
-            x=dates, y=probs,
-            marker_color='orange',
-            name='Risk Probability',
-            text=[f"{p:.1%}" if p > 0.01 else "" for p in probs],
-            textposition='auto'
-        ))
-        
-        fig_hist.update_layout(
-            title='When will the grid hit <30%? (Risk Probability per Week)',
-            yaxis_title='Probability',
-            height=400, template='plotly_white'
-        )
+        fig_hist = go.Figure(go.Bar(x=dates, y=probs, marker_color='orange', name='Risk'))
+        fig_hist.update_layout(title='When will we hit 30%?', height=400, template='plotly_white')
         st.plotly_chart(fig_hist, use_container_width=True)
 
 else:
-    st.info("👈 Use the **Control Center** in the sidebar to configure your scenario and run the simulation.")
+    st.info("👈 **Start here:** Adjust the Scenario in the sidebar and click **Update Analysis**.")
